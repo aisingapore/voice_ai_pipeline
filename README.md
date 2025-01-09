@@ -7,9 +7,9 @@ https://github.com/user-attachments/assets/4579e8fc-011e-4061-b987-9bc12b78848d
 # Set Up
 
 ## Overview
-There are four components involved, mainly a [Pipecat](https://github.com/pipecat-ai/pipecat) server, found in this repository which orchestrate the end-to-end pipeline, and three distinct models for each step in the pipeline: speech-to-text (STT) model, instruction-tuned text completion model and text-to-speech model (TTS). In this case, [Whisper](https://huggingface.co/openai/whisper-large-v2), [SEA-LIONv2](https://huggingface.co/aisingapore/llama3-8b-cpt-sea-lionv2.1-instruct) and [XTTS](https://huggingface.co/coqui/XTTS-v2) is used correspondingly. Other models can be substituted, such as [Parler-TTS](https://github.com/huggingface/parler-tts) for TTS with some adjustments to the current code. 
+There are four components involved, mainly a [Pipecat](https://github.com/pipecat-ai/pipecat) server, found in this repository which orchestrates the end-to-end pipeline, and three distinct models for each step in the pipeline: speech-to-text (STT) model, instruction-tuned text completion model and text-to-speech model (TTS). In this case, [Whisper](https://huggingface.co/openai/whisper-large-v2), [SEA-LIONv2](https://huggingface.co/aisingapore/llama3-8b-cpt-sea-lionv2.1-instruct) and [XTTS](https://huggingface.co/coqui/XTTS-v2) is used correspondingly. Other models can be substituted, such as [Parler-TTS](https://github.com/huggingface/parler-tts) for TTS with some adjustments to the current code. 
 
-To support realtime capabilities, GPU-acceleration is required for running models, so you will need to host each model on a [L40s](https://aws.amazon.com/ec2/instance-types/g6e/) GPU minimally based on my experience, to achieve realtime performance. The hosted server should then be integrated to the interface provided by Pipecat, which might require additional effort to do so depending on how the substitute model encodes input and decodes output. This part can be tricky and model dependent, especially for the STT and TTS step.
+To support realtime capabilities, GPU-acceleration is required for running models, so you will need to host each model on a [L40s](https://aws.amazon.com/ec2/instance-types/g6e/) GPU minimally based on my experience, to achieve realtime performance. The hosted server should then be integrated to the interface provided by Pipecat, which might require additional effort to do so depending on how the substitute model encodes input and decodes output. This part can be tricky and model dependent, especially for the STT and TTS step. See section ```Configuring STT and TTS Servers``` below for more details, especially on known concurrency issue for TTS server.
 
 ## Pipecat Orchestration Server 
 
@@ -50,10 +50,13 @@ It has been configured to only allow a concurrency of 1 (`max_inputs=1`) as each
 
 # Configuring STT and TTS Servers
 ## Speech-to-Text (STT)
-My Whisper streaming server implementation can be found [here](https://github.com/theogbrand/whisper-server), which is ran using docker.
+My Whisper streaming server implementation can be found [here](https://github.com/theogbrand/whisper-server), which is ran using docker. Clone the repository to a GPU machine with Docker set up and run docker compose. Multithreaded streaming for this STT server should not be an issue.
 
 ## Text-to-Speech (TTS)
-[XTTS streaming server](https://github.com/coqui-ai/xtts-streaming-server/blob/main/server/main.py) is ran here using docker.
+[XTTS streaming server](https://github.com/coqui-ai/xtts-streaming-server) is ran here using docker. Just clone into a GPU machine separate from the STT server and it should run. You could explore having both STT/TTS with a group of GPUs but will need to provide the batching logic for this.
+
+**Currently multithreaded inference for TTS here is not implemented yet, which prevents the voice bot from serving multiple users at once. 
+Implementing concurrent streaming decoding, required for realtime capabilities, seems to be non-trivial, and need to be patched for this demo to go live and serve multiple users.
 
 ## Cloud Hosting Set Up
 Having tried model hosting services like Replicate, Modal, RunPod, LambdaLabs, I find the simplest way to deploy the inference servers to be a canonical AWS GPU server. You can use my [Packer image](https://github.com/theogbrand/ai-server-setup/blob/main/aws/packer/l40s-48gb-ubuntu-docker-nvidia.pkr.hcl) to easily set up CUDA and Docker dependencies. The same image is used to set up both Whisper and XTTS servers above.
