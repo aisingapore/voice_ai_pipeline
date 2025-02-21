@@ -6,9 +6,10 @@ import sys
 import aiohttp
 from dotenv import load_dotenv
 from loguru import logger
+import datetime
+import ssl
 
 load_dotenv(override=True)
-
 logger.remove(0)
 logger.add(sys.stderr, level="DEBUG")
 
@@ -21,6 +22,7 @@ async def main(room_url: str, token: str):
     from pipecat.pipeline.task import PipelineParams, PipelineTask
     from pipecat.processors.aggregators.openai_llm_context import OpenAILLMContext
     from pipecat.services.xtts import XTTSService
+    from pipecat.services.cartesia import CartesiaTTSService
     from pipecat.services.openai import OpenAILLMService
     from pipecat.transports.services.daily import DailyParams, DailyTransport
     from pipecat.transcriptions.language import Language
@@ -29,17 +31,31 @@ async def main(room_url: str, token: str):
         ErrorFrame,
         Frame,
         TranscriptionFrame,
+        CancelFrame,
+        EndFrame,
+        ErrorFrame,
+        Frame,
+        AudioRawFrame,
+        InterimTranscriptionFrame,
+        StartFrame,
+        TranscriptionFrame,
+        UserStartedSpeakingFrame,
+        UserStoppedSpeakingFrame,
     )
+    from pipecat.processors.frame_processor import FrameDirection
     from pipecat.services.ai_services import SegmentedSTTService
     from pipecat.utils.time import time_now_iso8601
     from typing import AsyncGenerator
     import io
     import wave
     import numpy as np
+    import urllib.parse
+
     class Model(Enum):
         """Available OpenAI Whisper API models"""
 
         WHISPER_1 = "whisper-1"
+        ABAX_TRI = "default"
 
     class WhisperAPIService(
         SegmentedSTTService
@@ -158,6 +174,96 @@ async def main(room_url: str, token: str):
             """Convert internal language enum to ISO-639-1 codes"""
             return str(language.value).split("-")[0].lower()
 
+    class AbaxASRService(
+        SegmentedSTTService
+    ):  # override SegmentedSTTService from Pipecat
+        # Unusual to be placed here, expected for these changes to be in the Whisper server, though I found it simpler to do this for now to fit the Pipecat interface.
+        """Service for OpenAI's Whisper API transcription"""
+
+        def __init__(
+            self,
+            *,
+            api_key: str,
+            model: str | Model = Model.ABAX_TRI,
+            base_url: str = "wss://gateway.speechlab.sg/client/ws/speech",
+            sample_rate: int = 16000,
+            **kwargs,
+        ):
+            super().__init__(**kwargs)
+            self._api_key = api_key
+            self._base_url = base_url.rstrip("/") + '?%s' % (urllib.parse.urlencode([("content-type", "content-type")])) + \
+                '&%s' % (urllib.parse.urlencode([("accessToken", api_key)])) + \
+                '&%s' % (urllib.parse.urlencode([("token", api_key)])) + '&%s' % urllib.parse.urlencode([("model", model)])
+            self._session: aiohttp.ClientSession | None = None
+            self._sample_rate = sample_rate
+            self._audio_buffer = []
+            self.chunk_size = 1280
+            self.user_query = ""
+            self.user_stopped = False
+        
+        async def _connect_ws(self):
+            """Establishes a WebSocket connection."""
+            ssl_context = ssl.create_default_context()
+            ssl_context.check_hostname = False
+            ssl_context.verify_mode = ssl.CERT_NONE  # Disable SSL verification (not recommended for production)
+
+            if self._session is None:
+                self._session = aiohttp.ClientSession()
+
+            self._ws = await self._session.ws_connect(
+                self._base_url,
+                headers={"Authorization": f"Bearer {self._api_key}"},
+                ssl=ssl_context  # Bypass SSL verification
+            )
+            print("Connected to WebSocket")
+
+        async def run_stt(self, audio: bytes) -> AsyncGenerator[Frame, None]:
+            await self.start_metrics()
+        
+            if not hasattr(self, "_ws") or self._ws.closed:
+                await self._connect_ws()
+
+            audiostream = io.BytesIO(audio)
+            for block in iter(lambda: audiostream.read(int(1280)), b""):
+                if block:
+                    await self._ws.send_bytes(block)
+            # await self._ws.send_bytes(audio)
+                    
+            # Send EOS message to indicate the end of audio input
+            await self._ws.send_str("eos")
+
+            async for msg in self._ws:
+                logger.debug(f"Abax ASR message: [{msg}]")
+
+                if msg.type == aiohttp.WSMsgType.TEXT:
+                    result = msg.json()
+                    if "result" in result:
+                        isFinal = result["result"].get("final", False)
+                        hypotheses = result["result"].get("hypotheses", [])
+                        text = hypotheses[0].get("transcript", "").strip()
+                        if text:
+                            if isFinal:
+                                logger.debug(f"\n\nTranscription: [{text}]")
+                                yield TranscriptionFrame(text, "", time_now_iso8601())
+                                break  # Stop once final transcript is received
+                            else:
+                                self.user_query = text
+
+                elif msg.type == aiohttp.WSMsgType.CLOSED:
+                    print("WebSocket connection closed")
+                    break
+                elif msg.type == aiohttp.WSMsgType.ERROR:
+                    yield ErrorFrame(f"WebSocket error: {self._ws.exception()}")
+                    break
+            
+            await self.stop_processing_metrics()
+            yield None
+            
+        async def start_metrics(self):
+            await self.start_ttfb_metrics()
+            await self.start_processing_metrics()
+        
+        
     class SealionLLMService(OpenAILLMService):
         """A service for interacting with any OpenAI-compatible interface.
 
@@ -193,7 +299,7 @@ async def main(room_url: str, token: str):
             "bot",
             DailyParams(
                 audio_out_enabled=True,
-                audio_out_sample_rate=24000,  # TODO: be careful with this setting, it is model specific e.g. audio_out_sample_rate should match the sample rate specified by the specifications of the STT model
+                audio_out_sample_rate=16000,  # TODO: be careful with this setting, it is model specific e.g. audio_out_sample_rate should match the sample rate specified by the specifications of the STT model
                 transcription_enabled=False,
                 vad_enabled=True,
                 vad_analyzer=SileroVADAnalyzer(),
@@ -202,28 +308,30 @@ async def main(room_url: str, token: str):
         )
 
         # stt = WhisperAPIService(api_key=os.getenv("OPENAI_API_KEY"), model="whisper-1") # for using OpenAI's Whisper API
-        stt = WhisperAPIService(
-            api_key=os.getenv(
-                "WHISPER_API_KEY"
-            ),  # replace with your own API key for the Whisper server
-            base_url="http://35.91.186.23:8000/v1",  # TODO: replace with your own base URL for the Whisper server
-            model="whisper-1",
-        )
+        stt = AbaxASRService(api_key=os.getenv("ABAX_ASR_KEY"), 
+                             model="default")
+        # stt = WhisperAPIService(
+        #     api_key=os.getenv(
+        #         "WHISPER_API_KEY"
+        #     ),  # replace with your own API key for the Whisper server
+        #     base_url="https://api.openai.com/v1",  # TODO: replace with your own base URL for the Whisper server
+        #     model="whisper-1",
+        # )
 
-        # tts = CartesiaTTSService(
-        #     api_key=os.getenv("CARTESIA_API_KEY", ""), voice_id="79a125e8-cd45-4c13-8a67-188112f4dd22"
-        # ) # for using Cartesia's API
-        tts = XTTSService(
-            aiohttp_session=session,
-            voice_id="Ana Florence",  # Marcos Rudaski
-            language=Language.EN,
-            base_url="http://35.94.29.191:8000",  # TODO: replace with your own base URL for the XTTS server
-        )
+        tts = CartesiaTTSService(
+            api_key=os.getenv("CARTESIA_API_KEY", ""), voice_id="79a125e8-cd45-4c13-8a67-188112f4dd22"
+        ) # for using Cartesia's API
+        # tts = XTTSService(
+        #     aiohttp_session=session,
+        #     voice_id="Ana Florence",  # Marcos Rudaski
+        #     language=Language.EN,
+        #     base_url="http://35.94.29.191:8000",  # TODO: replace with your own base URL for the XTTS server
+        # )
 
-        # llm = OpenAILLMService(api_key=os.getenv("OPENAI_API_KEY"), model="gpt-4o") # for using OpenAI's API
-        llm = SealionLLMService(
-            api_key=os.getenv("AISG_API_KEY"),
-        )  # for using SEA-LION's API
+        llm = OpenAILLMService(api_key=os.getenv("OPENAI_API_KEY"), model="gpt-4o") # for using OpenAI's API
+        # llm = SealionLLMService(
+        #     api_key=os.getenv("AISG_API_KEY"),
+        # )  # for using SEA-LION's API
 
         messages = [
             {
